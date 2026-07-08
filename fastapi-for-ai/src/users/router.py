@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta, timezone
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 from config import settings
+from src.core.rate_limit import limiter
 from .dependencies import get_db
 from .service import UserService
 from . import models
@@ -87,8 +88,9 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
     return service.create_user(user)
 
 
-@router.get("", response_model=list[UserResponse])
-def get_users(db: Session = Depends(get_db)):
+@router.get("", response_model=list[UserResponse])  # static — same for everyone
+@limiter.limit("5/minute")  # rate limit applied to this endpoint
+async def get_users(request: Request, db: Session = Depends(get_db)):
     service = UserService(db)
     return service.get_all_users()
 

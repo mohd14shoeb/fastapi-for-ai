@@ -7,8 +7,13 @@ from datetime import datetime, timezone
 from fastapi.middleware.cors import CORSMiddleware
 from database import Base, engine
 from dotenv import load_dotenv
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
+from src.core.rate_limit import limiter
 from src.users.router import router as user_router
 from src.documents.router import router as files_router
+from src.webcrawllingpage.router import router as webcrawl_router
 
 # from src.core.handlers import register_exception_handlers
 
@@ -18,6 +23,9 @@ allowed_origins = (
 )
 app = FastAPI()
 load_dotenv()  # Load environment variables from .env file
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,3 +50,4 @@ async def log_request_time(request: Request, call_next):
 
 app.include_router(user_router)
 app.include_router(files_router)
+app.include_router(webcrawl_router)

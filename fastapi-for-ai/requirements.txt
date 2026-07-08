@@ -44,3 +44,4 @@ websockets==16.0
 python-jose[cryptography]
 python-multipart
 passlib[bcrypt]
+python-dotenv

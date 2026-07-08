@@ -48,3 +48,4 @@ python-dotenv
 requests
 beautifulsoup4
 slowapi
+sqlalchemy

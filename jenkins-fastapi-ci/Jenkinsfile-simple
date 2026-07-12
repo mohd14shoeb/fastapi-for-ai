@@ -1,0 +1,117 @@
+// Simpler Pipeline: no dependency on readFile of external script.
+// Commit smoke-test.sh to repo root, OR paste its body into the sh step.
+
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+  }
+
+  // Prefer GitHub webhook; pollSCM is a localhost-friendly fallback
+  triggers {
+    pollSCM('H/2 * * * *')
+  }
+
+  environment {
+    PORT       = '8000'
+    SECRET_KEY = 'ci-smoke-test-secret-key'
+    CRAWLING_URL = 'https://news.ycombinator.com/'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Start API → smoke test → stop') {
+      steps {
+        sh '''
+          set -euo pipefail
+          if [ -f smoke-test.sh ]; then
+            chmod +x smoke-test.sh
+            APP_DIR=fastapi-for-ai ./smoke-test.sh
+          else
+            echo "smoke-test.sh not in repo — using inline script"
+            APP_DIR=fastapi-for-ai
+            HOST=127.0.0.1
+            BASE_URL="http://${HOST}:${PORT}"
+            PID_FILE=".uvicorn-ci.pid"
+            LOG_FILE="uvicorn-ci.log"
+
+            cleanup() {
+              if [ -f "$APP_DIR/$PID_FILE" ]; then
+                kill "$(cat "$APP_DIR/$PID_FILE")" 2>/dev/null || true
+                rm -f "$APP_DIR/$PID_FILE"
+              fi
+              if command -v lsof >/dev/null 2>&1; then
+                PIDS=$(lsof -ti tcp:${PORT} -sTCP:LISTEN 2>/dev/null || true)
+                [ -n "${PIDS:-}" ] && kill $PIDS 2>/dev/null || true
+              fi
+            }
+            trap cleanup EXIT
+
+            cd "$APP_DIR"
+            python3 -m venv .venv-ci
+            . .venv-ci/bin/activate
+            pip install -q --upgrade pip
+            pip install -q -r requirements.txt
+
+            export SECRET_KEY DATABASE_URL="sqlite:///./users_ci.db"
+            export allowed_origins="http://localhost"
+            export CRAWLING_URL
+
+            nohup uvicorn main:app --host "$HOST" --port "$PORT" >"$LOG_FILE" 2>&1 &
+            echo $! >"$PID_FILE"
+
+            for i in $(seq 1 60); do
+              curl -sf "$BASE_URL/openapi.json" >/dev/null && break
+              sleep 1
+              [ "$i" -eq 60 ] && { cat "$LOG_FILE"; exit 1; }
+            done
+
+            curl -sf "$BASE_URL/openapi.json" >/dev/null && echo OK openapi
+            curl -sf "$BASE_URL/docs" >/dev/null && echo OK docs
+            curl -sf "$BASE_URL/users" >/dev/null && echo OK users
+
+            UNIQUE="ci_$RANDOM$RANDOM"
+            EMAIL="${UNIQUE}@example.com"
+            PASS="CiPass123!"
+            CODE=$(curl -s -o /tmp/body -w "%{http_code}" -X POST "$BASE_URL/users" \
+              -H "Content-Type: application/json" \
+              -d "{\\"name\\":\\"$UNIQUE\\",\\"age\\":28,\\"email\\":\\"$EMAIL\\",\\"role\\":\\"user\\",\\"password\\":\\"$PASS\\",\\"address\\":{\\"street\\":\\"1 CI\\",\\"city\\":\\"Mumbai\\",\\"state\\":\\"MH\\",\\"zip_code\\":\\"400001\\"}}")
+            echo "POST /users → $CODE $(cat /tmp/body)"
+            [ "$CODE" = "200" ] || [ "$CODE" = "201" ] || exit 1
+
+            LOGIN=$(curl -s -X POST "$BASE_URL/users/login" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -d "username=${EMAIL}&password=${PASS}")
+            TOKEN=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['access_token'])" "$LOGIN")
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/users/protected" -H "Authorization: Bearer $TOKEN")
+            [ "$CODE" = "200" ] && echo OK protected || exit 1
+
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/users/99999999")
+            [ "$CODE" = "404" ] && echo OK not-found || exit 1
+
+            echo "All checks passed — trap will stop server"
+          fi
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      sh '''
+        if command -v lsof >/dev/null 2>&1; then
+          PIDS=$(lsof -ti tcp:${PORT} -sTCP:LISTEN 2>/dev/null || true)
+          [ -n "${PIDS:-}" ] && kill $PIDS 2>/dev/null || true
+        fi
+      '''
+    }
+    success { echo 'APIs healthy. Server stopped after checks.' }
+    failure { echo 'Smoke test failed — see console for which endpoint broke.' }
+  }
+}

@@ -1,0 +1,75 @@
+// Declarative Pipeline: on every push → start API → smoke test → stop server
+// Put this file at: repo root  OR  set "Script Path" to fastapi-for-ai/../Jenkinsfile
+// Recommended: commit this file to the repo root as Jenkinsfile
+
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+  }
+
+  triggers {
+    // Poll SCM every 2 minutes if GitHub webhook is not set up yet
+    pollSCM('H/2 * * * *')
+    // Prefer GitHub webhook (see README-JENKINS.md) and remove pollSCM later
+  }
+
+  environment {
+    PORT = '8000'
+    SECRET_KEY = 'ci-smoke-test-secret-key'
+    CRAWLING_URL = 'https://news.ycombinator.com/'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('API smoke test (start → check → stop)') {
+      steps {
+        sh '''
+          set -e
+          chmod +x smoke-test.sh 2>/dev/null || true
+          if [ -f smoke-test.sh ]; then
+            APP_DIR=fastapi-for-ai bash ./smoke-test.sh
+          elif [ -f fastapi-for-ai/../smoke-test.sh ]; then
+            APP_DIR=fastapi-for-ai bash ./smoke-test.sh
+          else
+            # Inline fallback if script not in repo yet
+            APP_DIR=fastapi-for-ai bash -s <<'SCRIPT'
+''' + readFile('smoke-test.sh') + '''
+SCRIPT
+          fi
+        '''
+      }
+    }
+  }
+
+  post {
+    success {
+      echo 'APIs are healthy. Server was stopped after checks.'
+    }
+    failure {
+      echo 'API smoke test failed. Check console log for which endpoint broke.'
+    }
+    always {
+      // extra safety: kill anything left on the test port
+      sh '''
+        if command -v lsof >/dev/null 2>&1; then
+          PIDS=$(lsof -ti tcp:${PORT} -sTCP:LISTEN 2>/dev/null || true)
+          if [ -n "$PIDS" ]; then
+            echo "post: killing leftover pids on :${PORT}: $PIDS"
+            kill $PIDS 2>/dev/null || true
+            sleep 1
+            kill -9 $PIDS 2>/dev/null || true
+          fi
+        fi
+      '''
+    }
+  }
+}

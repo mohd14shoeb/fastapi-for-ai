@@ -1,0 +1,93 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "CI: Smoke test (start API → check → stop)",
+      "type": "shell",
+      "command": "bash",
+      "args": ["${workspaceFolder}/run-local.sh"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "APP_ENV": "dev",
+          "PORT": "8000"
+        }
+      },
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "CI: Smoke test on port 8001",
+      "type": "shell",
+      "command": "bash",
+      "args": ["${workspaceFolder}/run-local.sh", "--port", "8001"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": { "APP_ENV": "dev" }
+      },
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "CI: Smoke test (stage env vars)",
+      "type": "shell",
+      "command": "bash",
+      "args": ["${workspaceFolder}/run-local.sh", "--env", "stage"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "App only: run uvicorn (keep running)",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "cd \"${input:repoPath}/fastapi-for-ai\" && python3 -m venv .venv-local && source .venv-local/bin/activate && pip install -q -r requirements.txt && export SECRET_KEY=local-dev DATABASE_URL=sqlite:///./users_local.db allowed_origins=http://localhost CRAWLING_URL=https://news.ycombinator.com/ && uvicorn main:app --reload --host 127.0.0.1 --port 8000"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "Clone fastapi-for-ai repo (if missing)",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "DEST=\"${workspaceFolder}/../fastapi-for-ai\"; if [ -d \"$DEST/.git\" ]; then echo \"Already cloned: $DEST\"; else git clone https://github.com/mohd14shoeb/fastapi-for-ai.git \"$DEST\"; fi; echo \"Repo: $DEST\""
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always" }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "repoPath",
+      "type": "promptString",
+      "description": "Full path to fastapi-for-ai git root",
+      "default": "${workspaceFolder}/../fastapi-for-ai"
+    }
+  ]
+}

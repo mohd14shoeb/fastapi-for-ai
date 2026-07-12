@@ -1,75 +1,134 @@
-// Declarative Pipeline: on every push → start API → smoke test → stop server
-// Put this file at: repo root  OR  set "Script Path" to fastapi-for-ai/../Jenkinsfile
-// Recommended: commit this file to the repo root as Jenkinsfile
+#!/bin/bash
+set -euo pipefail
 
-pipeline {
-  agent any
+APP_DIR="fastapi-for-ai"
+HOST="127.0.0.1"
+PORT="8000"
+BASE_URL="http://${HOST}:${PORT}"
+VENV_DIR=".venv-ci"
+PID_FILE=".uvicorn-ci.pid"
+LOG_FILE="uvicorn-ci.log"
+MAX_WAIT=60
 
-  options {
-    timestamps()
-    disableConcurrentBuilds()
-    buildDiscarder(logRotator(numToKeepStr: '20'))
-  }
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
-  triggers {
-    // Poll SCM every 2 minutes if GitHub webhook is not set up yet
-    pollSCM('H/2 * * * *')
-    // Prefer GitHub webhook (see README-JENKINS.md) and remove pollSCM later
-  }
-
-  environment {
-    PORT = '8000'
-    SECRET_KEY = 'ci-smoke-test-secret-key'
-    CRAWLING_URL = 'https://news.ycombinator.com/'
-  }
-
-  stages {
-    stage('Checkout') {
-      steps {
-        checkout scm
-      }
-    }
-
-    stage('API smoke test (start → check → stop)') {
-      steps {
-        sh '''
-          set -e
-          chmod +x smoke-test.sh 2>/dev/null || true
-          if [ -f smoke-test.sh ]; then
-            APP_DIR=fastapi-for-ai bash ./smoke-test.sh
-          elif [ -f fastapi-for-ai/../smoke-test.sh ]; then
-            APP_DIR=fastapi-for-ai bash ./smoke-test.sh
-          else
-            # Inline fallback if script not in repo yet
-            APP_DIR=fastapi-for-ai bash -s <<'SCRIPT'
-''' + readFile('smoke-test.sh') + '''
-SCRIPT
-          fi
-        '''
-      }
-    }
-  }
-
-  post {
-    success {
-      echo 'APIs are healthy. Server was stopped after checks.'
-    }
-    failure {
-      echo 'API smoke test failed. Check console log for which endpoint broke.'
-    }
-    always {
-      // extra safety: kill anything left on the test port
-      sh '''
-        if command -v lsof >/dev/null 2>&1; then
-          PIDS=$(lsof -ti tcp:${PORT} -sTCP:LISTEN 2>/dev/null || true)
-          if [ -n "$PIDS" ]; then
-            echo "post: killing leftover pids on :${PORT}: $PIDS"
-            kill $PIDS 2>/dev/null || true
-            sleep 1
-            kill -9 $PIDS 2>/dev/null || true
-          fi
-        fi
-      '''
-    }
-  }
+cleanup() {
+  EXIT_CODE=$?
+  log "Cleanup: stopping API server..."
+  if [ -f "$APP_DIR/$PID_FILE" ]; then
+    PID=$(cat "$APP_DIR/$PID_FILE" 2>/dev/null || true)
+    if [ -n "${PID:-}" ]; then
+      kill "$PID" 2>/dev/null || true
+      sleep 1
+      kill -9 "$PID" 2>/dev/null || true
+    fi
+    rm -f "$APP_DIR/$PID_FILE"
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    EXTRA=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+    if [ -n "${EXTRA:-}" ]; then
+      kill $EXTRA 2>/dev/null || true
+      kill -9 $EXTRA 2>/dev/null || true
+    fi
+  fi
+  if [ "$EXIT_CODE" -ne 0 ]; then
+    log "BUILD FAILED. Server log:"
+    [ -f "$APP_DIR/$LOG_FILE" ] && tail -n 80 "$APP_DIR/$LOG_FILE" || true
+  else
+    log "SUCCESS — all API checks passed; server stopped."
+  fi
+  exit "$EXIT_CODE"
 }
+trap cleanup EXIT INT TERM
+
+http_code() {
+  METHOD="$1"; URL="$2"; shift 2
+  curl -sS -o /tmp/ci_body.json -w "%{http_code}" -X "$METHOD" "$URL" "$@" || echo "000"
+}
+
+assert_eq() {
+  NAME="$1"; EXPECTED="$2"; ACTUAL="$3"
+  if [ "$ACTUAL" != "$EXPECTED" ]; then
+    log "FAIL: $NAME — expected $EXPECTED, got $ACTUAL"
+    log "Body: $(cat /tmp/ci_body.json 2>/dev/null || true)"
+    exit 1
+  fi
+  log "OK:   $NAME → HTTP $ACTUAL"
+}
+
+cd "$APP_DIR"
+log "In $(pwd)"
+
+python3 -m venv "$VENV_DIR"
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+python -m pip install -q --upgrade pip
+pip install -q -r requirements.txt
+
+export SECRET_KEY="ci-smoke-test-secret-key"
+export ALGORITHM="HS256"
+export ACCESS_TOKEN_EXPIRE_MINUTES="30"
+export DATABASE_URL="sqlite:///./users_ci.db"
+export allowed_origins="http://localhost,http://127.0.0.1"
+export CRAWLING_URL="https://news.ycombinator.com/"
+
+if command -v lsof >/dev/null 2>&1; then
+  OLD=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+  [ -n "${OLD:-}" ] && kill $OLD 2>/dev/null || true
+  sleep 1
+fi
+
+log "Starting uvicorn..."
+nohup uvicorn main:app --host "$HOST" --port "$PORT" --log-level info >"$LOG_FILE" 2>&1 &
+echo $! >"$PID_FILE"
+
+i=0
+while [ "$i" -lt "$MAX_WAIT" ]; do
+  CODE=$(curl -sS -o /dev/null -w "%{http_code}" "$BASE_URL/openapi.json" 2>/dev/null || echo "000")
+  [ "$CODE" = "200" ] && { log "Server is UP"; break; }
+  if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    cat "$LOG_FILE"; exit 1
+  fi
+  i=$((i + 1)); sleep 1
+done
+[ "$i" -ge "$MAX_WAIT" ] && { cat "$LOG_FILE"; exit 1; }
+
+log "========== API smoke tests =========="
+CODE=$(http_code GET "$BASE_URL/openapi.json"); assert_eq "GET /openapi.json" "200" "$CODE"
+CODE=$(http_code GET "$BASE_URL/docs"); assert_eq "GET /docs" "200" "$CODE"
+CODE=$(http_code GET "$BASE_URL/users"); assert_eq "GET /users" "200" "$CODE"
+
+UNIQUE="ci_user_$(date +%s)_$RANDOM"
+EMAIL="${UNIQUE}@example.com"
+PASSWORD="CiTestPass123!"
+USER_JSON=$(cat <<EOF
+{"name":"$UNIQUE","age":28,"email":"$EMAIL","role":"user","password":"$PASSWORD","address":{"street":"1 CI Street","city":"Mumbai","state":"MH","zip_code":"400001"}}
+EOF
+)
+
+CODE=$(http_code POST "$BASE_URL/users" -H "Content-Type: application/json" -d "$USER_JSON")
+[ "$CODE" = "200" ] || [ "$CODE" = "201" ] || { log "FAIL POST /users $CODE $(cat /tmp/ci_body.json)"; exit 1; }
+log "OK:   POST /users → HTTP $CODE"
+
+CODE=$(http_code POST "$BASE_URL/users/login" -H "Content-Type: application/x-www-form-urlencoded" -d "username=${EMAIL}&password=${PASSWORD}")
+assert_eq "POST /users/login" "200" "$CODE"
+
+TOKEN=$(python -c "import json; print(json.load(open('/tmp/ci_body.json')).get('access_token',''))")
+[ -n "$TOKEN" ] || { log "FAIL no token"; exit 1; }
+log "OK:   got JWT"
+
+CODE=$(http_code GET "$BASE_URL/users/protected" -H "Authorization: Bearer $TOKEN")
+assert_eq "GET /users/protected" "200" "$CODE"
+
+CODE=$(http_code GET "$BASE_URL/users/protected")
+[ "$CODE" = "401" ] || [ "$CODE" = "403" ] || { log "FAIL expected 401/403 got $CODE"; exit 1; }
+log "OK:   no-token protected → $CODE"
+
+CODE=$(http_code GET "$BASE_URL/users/99999999"); assert_eq "GET missing user" "404" "$CODE"
+CODE=$(http_code GET "$BASE_URL/files/download/nope.txt"); assert_eq "GET missing file" "404" "$CODE"
+
+CODE=$(http_code GET "$BASE_URL/webcrawl/news?page=1&limit=2")
+[ "$CODE" = "200" ] && log "OK: webcrawl" || log "WARN: webcrawl $CODE"
+
+log "========== All checks passed =========="
+exit 0

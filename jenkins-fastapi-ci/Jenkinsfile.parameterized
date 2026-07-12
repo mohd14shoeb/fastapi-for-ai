@@ -1,0 +1,393 @@
+// ============================================================
+// Parameterized Pipeline — "custom env page" with checkboxes
+//
+// Anyone can open the job → "Build with Parameters" and tick
+// what they need. Push builds also work: branch name sets
+// smart defaults (dev / release / feature).
+//
+// Setup: New Item → Pipeline → Pipeline script from SCM
+//        OR paste this into Pipeline script
+//        Branch Specifier: */*   (or leave for multibranch)
+// ============================================================
+
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+  }
+
+  // ---------- CUSTOM ENV PAGE (checkboxes + choices) ----------
+  parameters {
+    // Which git ref to build (branch or tag). Pre-filled on SCM trigger via default.
+    string(
+      name: 'GIT_REF',
+      defaultValue: 'main',
+      description: 'Branch or tag to build (e.g. main, develop, feature/login, release/1.2)'
+    )
+
+    choice(
+      name: 'TARGET_ENV',
+      choices: ['auto', 'dev', 'stage', 'prod'],
+      description: 'Target environment. "auto" = derive from branch name (recommended).'
+    )
+
+    // --- Feature checkboxes (select / unselect) ---
+    booleanParam(
+      name: 'RUN_SMOKE_TESTS',
+      defaultValue: true,
+      description: '☑ Start local uvicorn → hit APIs → stop server'
+    )
+    booleanParam(
+      name: 'RUN_UNIT_HINT',
+      defaultValue: false,
+      description: '☑ Run pytest if tests/ exists (optional)'
+    )
+    booleanParam(
+      name: 'CHECK_OPENAPI',
+      defaultValue: true,
+      description: '☑ Check /openapi.json and /docs'
+    )
+    booleanParam(
+      name: 'CHECK_USERS_API',
+      defaultValue: true,
+      description: '☑ Check /users + create + login + protected'
+    )
+    booleanParam(
+      name: 'CHECK_FILES_API',
+      defaultValue: true,
+      description: '☑ Check /files download 404 path'
+    )
+    booleanParam(
+      name: 'CHECK_WEBCRAWL',
+      defaultValue: false,
+      description: '☑ Check /webcrawl/news (needs outbound network)'
+    )
+    booleanParam(
+      name: 'DEPLOY_TO_ENV',
+      defaultValue: false,
+      description: '☑ Deploy after tests pass (stage/prod only — configure hook below)'
+    )
+    booleanParam(
+      name: 'PROD_READ_ONLY',
+      defaultValue: true,
+      description: '☑ If TARGET_ENV=prod: only GET health checks (no POST create user)'
+    )
+    booleanParam(
+      name: 'NOTIFY_SLACK',
+      defaultValue: false,
+      description: '☑ Print notify payload (hook your Slack later)'
+    )
+
+    string(
+      name: 'CUSTOM_PORT',
+      defaultValue: '8000',
+      description: 'Local uvicorn port for this build'
+    )
+    string(
+      name: 'EXTRA_NOTES',
+      defaultValue: '',
+      description: 'Optional note for this build (shows in console)'
+    )
+  }
+
+  environment {
+    APP_SUBDIR = 'fastapi-for-ai'
+  }
+
+  stages {
+
+    stage('Resolve environment & branch') {
+      steps {
+        script {
+          // Prefer explicit GIT_REF param; fall back to multibranch BRANCH_NAME / SCM
+          def ref = params.GIT_REF?.trim()
+          if (!ref || ref == 'main') {
+            if (env.BRANCH_NAME) {
+              ref = env.BRANCH_NAME
+            } else if (env.GIT_BRANCH) {
+              ref = env.GIT_BRANCH.replaceFirst(/^origin\//, '')
+            }
+          }
+          env.RESOLVED_REF = ref ?: 'main'
+
+          // auto env from branch name
+          def branch = env.RESOLVED_REF.toLowerCase()
+          def autoEnv = 'dev'
+          if (branch == 'main' || branch == 'master' || branch.startsWith('release')) {
+            autoEnv = 'stage'
+          } else if (branch.startsWith('hotfix') || branch.startsWith('prod')) {
+            autoEnv = 'prod'
+          } else if (branch == 'develop' || branch == 'dev' || branch.startsWith('feature')) {
+            autoEnv = 'dev'
+          }
+
+          if (params.TARGET_ENV == 'auto') {
+            env.APP_ENV = autoEnv
+          } else {
+            env.APP_ENV = params.TARGET_ENV
+          }
+
+          env.CI_PORT = params.CUSTOM_PORT ?: '8000'
+
+          echo """
+========== BUILD MATRIX ==========
+  Git ref        : ${env.RESOLVED_REF}
+  TARGET_ENV     : ${params.TARGET_ENV}  → resolved APP_ENV=${env.APP_ENV}
+  RUN_SMOKE      : ${params.RUN_SMOKE_TESTS}
+  OPENAPI        : ${params.CHECK_OPENAPI}
+  USERS API      : ${params.CHECK_USERS_API}
+  FILES API      : ${params.CHECK_FILES_API}
+  WEBCRAWL       : ${params.CHECK_WEBCRAWL}
+  UNIT TESTS     : ${params.RUN_UNIT_HINT}
+  DEPLOY         : ${params.DEPLOY_TO_ENV}
+  PROD_READ_ONLY : ${params.PROD_READ_ONLY}
+  PORT           : ${env.CI_PORT}
+  Notes          : ${params.EXTRA_NOTES}
+==================================
+"""
+        }
+      }
+    }
+
+    stage('Checkout') {
+      steps {
+        checkout([
+          $class: 'GitSCM',
+          branches: [[name: "*/${env.RESOLVED_REF}"]],
+          userRemoteConfigs: [[
+            url: 'https://github.com/mohd14shoeb/fastapi-for-ai.git'
+          ]],
+          extensions: [[$class: 'CloneOption', shallow: true, depth: 1]]
+        ])
+      }
+    }
+
+    stage('Optional unit tests') {
+      when {
+        expression { return params.RUN_UNIT_HINT == true }
+      }
+      steps {
+        sh '''
+          set -e
+          cd "${APP_SUBDIR}"
+          python3 -m venv .venv-ci
+          . .venv-ci/bin/activate
+          pip install -q --upgrade pip
+          pip install -q -r requirements.txt
+          if [ -d tests ] || ls test_*.py 2>/dev/null | grep -q .; then
+            pip install -q pytest
+            pytest -q || exit 1
+          else
+            echo "No tests/ folder — skip pytest (checkbox was on but nothing to run)"
+          fi
+        '''
+      }
+    }
+
+    stage('API smoke (start → check → stop)') {
+      when {
+        expression { return params.RUN_SMOKE_TESTS == true }
+      }
+      steps {
+        sh '''
+          set -euo pipefail
+          APP_DIR="${APP_SUBDIR}"
+          HOST="127.0.0.1"
+          PORT="${CI_PORT}"
+          BASE_URL="http://${HOST}:${PORT}"
+          VENV_DIR=".venv-ci"
+          PID_FILE=".uvicorn-ci.pid"
+          LOG_FILE="uvicorn-ci.log"
+          MAX_WAIT=60
+          APP_ENV="${APP_ENV}"
+
+          log() { echo "[$(date '+%H:%M:%S')] [env=$APP_ENV] $*"; }
+
+          cleanup() {
+            EC=$?
+            log "Cleanup: stop server..."
+            if [ -f "$APP_DIR/$PID_FILE" ]; then
+              PID=$(cat "$APP_DIR/$PID_FILE" 2>/dev/null || true)
+              [ -n "${PID:-}" ] && kill "$PID" 2>/dev/null || true
+              sleep 1
+              [ -n "${PID:-}" ] && kill -9 "$PID" 2>/dev/null || true
+              rm -f "$APP_DIR/$PID_FILE"
+            fi
+            if command -v lsof >/dev/null 2>&1; then
+              X=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+              [ -n "${X:-}" ] && kill $X 2>/dev/null || true
+            fi
+            [ "$EC" -ne 0 ] && [ -f "$APP_DIR/$LOG_FILE" ] && tail -n 80 "$APP_DIR/$LOG_FILE" || true
+            exit $EC
+          }
+          trap cleanup EXIT INT TERM
+
+          http_code() {
+            M="$1"; U="$2"; shift 2
+            curl -sS -o /tmp/ci_body.json -w "%{http_code}" -X "$M" "$U" "$@" || echo "000"
+          }
+          assert_eq() {
+            N="$1"; E="$2"; A="$3"
+            if [ "$A" != "$E" ]; then
+              log "FAIL $N expected $E got $A body=$(cat /tmp/ci_body.json 2>/dev/null || true)"
+              exit 1
+            fi
+            log "OK $N → $A"
+          }
+
+          cd "$APP_DIR"
+          python3 -m venv "$VENV_DIR"
+          . "$VENV_DIR/bin/activate"
+          pip install -q --upgrade pip
+          pip install -q -r requirements.txt
+
+          # env-specific settings
+          case "$APP_ENV" in
+            prod)
+              export SECRET_KEY="${PROD_SECRET_KEY:-ci-should-not-use-prod-secret}"
+              export DATABASE_URL="${PROD_DATABASE_URL:-sqlite:///./users_ci.db}"
+              ;;
+            stage)
+              export SECRET_KEY="${STAGE_SECRET_KEY:-ci-stage-secret}"
+              export DATABASE_URL="${STAGE_DATABASE_URL:-sqlite:///./users_ci.db}"
+              ;;
+            *)
+              export SECRET_KEY="ci-dev-secret-key"
+              export DATABASE_URL="sqlite:///./users_ci.db"
+              ;;
+          esac
+          export ALGORITHM="HS256"
+          export ACCESS_TOKEN_EXPIRE_MINUTES="30"
+          export allowed_origins="http://localhost,http://127.0.0.1"
+          export CRAWLING_URL="https://news.ycombinator.com/"
+          export APP_ENV
+
+          if command -v lsof >/dev/null 2>&1; then
+            OLD=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+            [ -n "${OLD:-}" ] && kill $OLD 2>/dev/null || true
+            sleep 1
+          fi
+
+          log "Starting uvicorn $BASE_URL"
+          nohup uvicorn main:app --host "$HOST" --port "$PORT" --log-level info >"$LOG_FILE" 2>&1 &
+          echo $! >"$PID_FILE"
+
+          i=0
+          while [ "$i" -lt "$MAX_WAIT" ]; do
+            C=$(curl -sS -o /dev/null -w "%{http_code}" "$BASE_URL/openapi.json" 2>/dev/null || echo "000")
+            [ "$C" = "200" ] && { log "Server UP"; break; }
+            if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then cat "$LOG_FILE"; exit 1; fi
+            i=$((i+1)); sleep 1
+          done
+          [ "$i" -ge "$MAX_WAIT" ] && { cat "$LOG_FILE"; exit 1; }
+
+          log "===== Smoke checks (checkbox-driven) ====="
+
+          if [ "${CHECK_OPENAPI}" = "true" ]; then
+            C=$(http_code GET "$BASE_URL/openapi.json"); assert_eq "GET /openapi.json" "200" "$C"
+            C=$(http_code GET "$BASE_URL/docs"); assert_eq "GET /docs" "200" "$C"
+          else
+            log "SKIP openapi/docs (checkbox off)"
+          fi
+
+          if [ "${CHECK_USERS_API}" = "true" ]; then
+            C=$(http_code GET "$BASE_URL/users"); assert_eq "GET /users" "200" "$C"
+
+            # prod read-only: skip create/login mutations
+            if [ "$APP_ENV" = "prod" ] && [ "${PROD_READ_ONLY}" = "true" ]; then
+              log "PROD_READ_ONLY: skip POST /users and login mutations"
+            else
+              UNIQUE="ci_${APP_ENV}_$(date +%s)_$RANDOM"
+              EMAIL="${UNIQUE}@example.com"
+              PASS="CiTestPass123!"
+              BODY="{\\"name\\":\\"$UNIQUE\\",\\"age\\":28,\\"email\\":\\"$EMAIL\\",\\"role\\":\\"user\\",\\"password\\":\\"$PASS\\",\\"address\\":{\\"street\\":\\"1 CI\\",\\"city\\":\\"Mumbai\\",\\"state\\":\\"MH\\",\\"zip_code\\":\\"400001\\"}}"
+              C=$(http_code POST "$BASE_URL/users" -H "Content-Type: application/json" -d "$BODY")
+              [ "$C" = "200" ] || [ "$C" = "201" ] || { log "FAIL POST /users $C $(cat /tmp/ci_body.json)"; exit 1; }
+              log "OK POST /users → $C"
+
+              C=$(http_code POST "$BASE_URL/users/login" -H "Content-Type: application/x-www-form-urlencoded" -d "username=${EMAIL}&password=${PASS}")
+              assert_eq "POST /users/login" "200" "$C"
+              TOKEN=$(python -c "import json; print(json.load(open('/tmp/ci_body.json')).get('access_token',''))")
+              [ -n "$TOKEN" ] || { log "FAIL no token"; exit 1; }
+
+              C=$(http_code GET "$BASE_URL/users/protected" -H "Authorization: Bearer $TOKEN")
+              assert_eq "GET /users/protected" "200" "$C"
+            fi
+
+            C=$(http_code GET "$BASE_URL/users/99999999"); assert_eq "GET missing user" "404" "$C"
+          else
+            log "SKIP users API (checkbox off)"
+          fi
+
+          if [ "${CHECK_FILES_API}" = "true" ]; then
+            C=$(http_code GET "$BASE_URL/files/download/nope-ci.txt")
+            assert_eq "GET missing file" "404" "$C"
+          else
+            log "SKIP files API (checkbox off)"
+          fi
+
+          if [ "${CHECK_WEBCRAWL}" = "true" ]; then
+            C=$(http_code GET "$BASE_URL/webcrawl/news?page=1&limit=2")
+            [ "$C" = "200" ] && log "OK webcrawl → 200" || log "WARN webcrawl → $C"
+          else
+            log "SKIP webcrawl (checkbox off)"
+          fi
+
+          log "===== All selected checks passed ====="
+          exit 0
+        '''
+      }
+    }
+
+    stage('Deploy (optional)') {
+      when {
+        allOf {
+          expression { return params.DEPLOY_TO_ENV == true }
+          expression { return env.APP_ENV == 'stage' || env.APP_ENV == 'prod' }
+        }
+      }
+      steps {
+        script {
+          if (env.APP_ENV == 'prod') {
+            // Safety gate for production
+            input message: "Deploy to PRODUCTION from ${env.RESOLVED_REF}?", ok: 'Deploy'
+          }
+          echo "Deploy hook for APP_ENV=${env.APP_ENV} — plug Render/API deploy here"
+          // Example:
+          // sh 'curl -X POST "$RENDER_DEPLOY_HOOK_URL"'
+          sh 'echo "TODO: call your deploy hook for ${APP_ENV}"'
+        }
+      }
+    }
+
+    stage('Notify (optional)') {
+      when {
+        expression { return params.NOTIFY_SLACK == true }
+      }
+      steps {
+        echo "NOTIFY: build=${env.BUILD_URL} env=${env.APP_ENV} ref=${env.RESOLVED_REF} result=running"
+      }
+    }
+  }
+
+  post {
+    always {
+      sh '''
+        PORT="${CI_PORT:-8000}"
+        if command -v lsof >/dev/null 2>&1; then
+          P=$(lsof -ti tcp:$PORT -sTCP:LISTEN 2>/dev/null || true)
+          [ -n "${P:-}" ] && kill $P 2>/dev/null || true
+        fi
+      '''
+    }
+    success {
+      echo "SUCCESS — env=${env.APP_ENV} ref=${env.RESOLVED_REF}"
+    }
+    failure {
+      echo "FAILURE — env=${env.APP_ENV} ref=${env.RESOLVED_REF} — see console"
+    }
+  }
+}

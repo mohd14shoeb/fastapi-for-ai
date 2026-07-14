@@ -10,7 +10,7 @@ class Settings:
     ALLOWED_ORIGINS: list = (
         os.getenv("allowed_origins", "").split(",")
         if os.getenv("allowed_origins")
-        else []
+        else ["https://fastapi-for-ai.onrender.com/"]
     )
     SECRET_KEY: str = os.getenv("SECRET_KEY", "supersecretkey")
     ALGORITHM: str = os.getenv("ALGORITHM", "HS256")

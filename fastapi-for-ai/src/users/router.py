@@ -8,7 +8,7 @@ from src.core.rate_limit import limiter
 from .dependencies import get_db
 from .service import UserService
 from . import models
-from .schemas import UserCreate, UserResponse, AddressResponse
+from .schemas import UserAddressCreate, UserCreate, UserResponse, AddressResponse
 from .utils import password_context
 
 
@@ -131,7 +131,7 @@ def update_address(
 
 @router.post("/{user_id}/address", response_model=AddressResponse)
 def create_user_address(
-    user_id: int, address: UserCreate, db: Session = Depends(get_db)
+    user_id: int, address: UserAddressCreate, db: Session = Depends(get_db)
 ):
     service = UserService(db)
     new_address = service.create_user_address(user_id, address)

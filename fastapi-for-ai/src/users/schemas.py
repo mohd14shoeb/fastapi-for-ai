@@ -8,7 +8,7 @@ class UserRole(str, Enum):
     CLIENT = "client"
 
 
-class UserAddress(BaseModel):
+class UserAddressCreate(BaseModel):
     street: str
     city: str
     state: str
@@ -32,7 +32,7 @@ class UserCreate(BaseModel):
     age: int
     email: str
     role: UserRole
-    address: UserAddress
+    address: UserAddressCreate
     password: str
 
 
